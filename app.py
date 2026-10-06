@@ -183,6 +183,9 @@ with col2:
 with col3:
     default_image_cols = [h for h in headers if h not in (sku_col, title_col)]
     image_cols = st.multiselect("Image URL column(s)", headers, default=default_image_cols)
+    # Always keep image columns in the same left-to-right order as the
+    # uploaded file, regardless of the order they were clicked/selected in.
+    image_cols = sorted(image_cols, key=lambda c: headers.index(c))
 
 if not image_cols:
     st.warning("Pick at least one image column to see thumbnails.")
@@ -215,11 +218,13 @@ if swap_mode:
         for i, col in enumerate(image_cols):
             with row_cols[2 + i]:
                 val = str(row[col]) if pd.notna(row[col]) else ""
-                if is_url(val):
-                    st.image(val, width=thumb_size, caption=col)
-                else:
+                if not is_url(val):
+                    # Not an actual image URL for this row — show it, but
+                    # it's not something you can swap, so no Select button.
                     st.caption(col)
                     st.write(val if val else "—")
+                    continue
+                st.image(val, width=thumb_size, caption=col)
                 selection = (row_idx, col)
                 is_selected = pending == selection
                 if st.button(
