@@ -261,6 +261,25 @@ def build_full_report(table_html: str, mode: str = "light") -> str:
 </html>"""
 
 
+def build_two_tab_pivot_excel(base_pivot_df, pivot_df, id_cols, image_cols, swapped_rows):
+    """Same idea as build_two_tab_excel, for the pivoted PXM tabs (PXM
+    Filename + URL Export, PXM Media Stack):
+    - "Original": identifier column(s) + Image columns exactly as uploaded.
+    - "Reorder": identifier column(s) + Image columns, ONLY for the rows
+      that actually had a swap queued, with that swap applied.
+    """
+    original_df = base_pivot_df[id_cols + image_cols].copy()
+
+    reorder_rows = sorted(swapped_rows)
+    reorder_df = pivot_df.loc[reorder_rows, id_cols + image_cols].copy()
+
+    buf = io.BytesIO()
+    with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+        original_df.to_excel(writer, sheet_name="Original", index=False)
+        reorder_df.to_excel(writer, sheet_name="Reorder", index=False)
+    return buf.getvalue()
+
+
 def build_two_tab_excel(base_data, data, sku_col, title_col, image_cols, swapped_rows):
     """A plain .xlsx with two tabs:
     - "Original": SKU, Title, Image URLs exactly as uploaded, no swaps.
@@ -300,41 +319,49 @@ def build_swapped_workbook(file_bytes, sheet_name, headers, header_row_idx, swap
 
 
 def parse_pxm_filename(filename):
-    """Pull the MPN and the image sequence number out of a PXM filename
-    like "50540_P07HR2C3_WM_US_ISP_04.jpg" -> ("P07HR2C3", 4).
-    Returns (None, None) if the filename doesn't look like that shape."""
+    """Pull the MPN, Master ID, and image sequence number out of a PXM
+    filename, following the fixed convention
+    MPN_MasterID_MarketplaceCode_Region_ISP_XX
+    e.g. "50540_P07HR2C3_WM_US_ISP_04.jpg" -> ("50540", "P07HR2C3", 4).
+    Returns (None, None, None) if the filename doesn't look like that shape."""
     if not isinstance(filename, str) or not filename.strip():
-        return None, None
+        return None, None, None
     base = filename.rsplit(".", 1)[0]
     parts = base.split("_")
     if len(parts) < 2:
-        return None, None
-    mpn = parts[1]
+        return None, None, None
+    mpn = parts[0]
+    master_id = parts[1]
     try:
         seq = int(parts[-1])
     except ValueError:
         seq = None
-    return mpn, seq
+    return mpn, master_id, seq
 
 
 PXM_ID_COL = "SKU / Identifier"
+PXM_MPN_COL = "MPN"
+PXM_MASTER_ID_COL = "Master ID"
 
 
 def build_pxm_pivot(df, filename_col, url_col):
     """Group PXM export rows by MPN and lay each MPN's images out in one
-    row, ordered by the sequence number encoded in the filename."""
+    row (MPN, Master ID, then Image 1..N), ordered by the sequence number
+    encoded in the filename."""
     groups = {}
+    master_ids = {}
     for idx, row in df.iterrows():
         fname, url = row[filename_col], row[url_col]
         if pd.isna(fname) or pd.isna(url) or not str(url).strip():
             continue
-        mpn, seq = parse_pxm_filename(str(fname))
+        mpn, master_id, seq = parse_pxm_filename(str(fname))
         if mpn is None:
             continue
         groups.setdefault(mpn, []).append({"seq": seq, "url": str(url).strip(), "orig_idx": idx})
+        master_ids.setdefault(mpn, master_id or "")
 
     if not groups:
-        return pd.DataFrame(columns=[PXM_ID_COL]), []
+        return pd.DataFrame(columns=[PXM_MPN_COL, PXM_MASTER_ID_COL]), []
 
     for mpn in groups:
         groups[mpn].sort(key=lambda r: (r["seq"] is None, r["seq"] if r["seq"] is not None else 0, r["orig_idx"]))
@@ -344,54 +371,62 @@ def build_pxm_pivot(df, filename_col, url_col):
 
     rows_out = []
     for mpn in sorted(groups.keys()):
-        entry = {PXM_ID_COL: mpn}
+        entry = {PXM_MPN_COL: mpn, PXM_MASTER_ID_COL: master_ids.get(mpn, "")}
         for i, col_name in enumerate(image_cols):
             entry[col_name] = groups[mpn][i]["url"] if i < len(groups[mpn]) else ""
         rows_out.append(entry)
 
-    pivot_df = pd.DataFrame(rows_out, columns=[PXM_ID_COL] + image_cols)
+    pivot_df = pd.DataFrame(rows_out, columns=[PXM_MPN_COL, PXM_MASTER_ID_COL] + image_cols)
     return pivot_df, image_cols
 
 
-def build_media_stack_pivot(df, id_col, position_col, link_col):
-    """Group already-filtered Media Stack rows by SKU and lay each SKU's
-    images out in one row, ordered by the Image Position column."""
+def build_media_stack_pivot(df, filename_col, position_col, link_col):
+    """Group already-filtered Media Stack rows by MPN (parsed from the
+    Filename column, same compulsory rule as the PXM export: everything
+    before the first "_" is the MPN, the segment right after it is the
+    Master ID) and lay each MPN's images out in one row, ordered by the
+    Image Position column."""
     groups = {}
+    master_ids = {}
     for idx, row in df.iterrows():
-        sku, pos, url = row[id_col], row[position_col], row[link_col]
-        if pd.isna(sku) or pd.isna(url) or not str(url).strip():
+        fname, pos, url = row[filename_col], row[position_col], row[link_col]
+        if pd.isna(fname) or pd.isna(url) or not str(url).strip():
+            continue
+        mpn, master_id, _seq = parse_pxm_filename(str(fname))
+        if mpn is None:
             continue
         try:
             pos_val = float(pos)
         except (TypeError, ValueError):
             pos_val = None
-        groups.setdefault(str(sku), []).append({"pos": pos_val, "url": str(url).strip(), "orig_idx": idx})
+        groups.setdefault(mpn, []).append({"pos": pos_val, "url": str(url).strip(), "orig_idx": idx})
+        master_ids.setdefault(mpn, master_id or "")
 
     if not groups:
-        return pd.DataFrame(columns=[PXM_ID_COL]), []
+        return pd.DataFrame(columns=[PXM_MPN_COL, PXM_MASTER_ID_COL]), []
 
-    for sku in groups:
-        groups[sku].sort(key=lambda r: (r["pos"] is None, r["pos"] if r["pos"] is not None else 0, r["orig_idx"]))
+    for mpn in groups:
+        groups[mpn].sort(key=lambda r: (r["pos"] is None, r["pos"] if r["pos"] is not None else 0, r["orig_idx"]))
 
     max_images = max(len(v) for v in groups.values())
     image_cols = [f"Image {i + 1}" for i in range(max_images)]
 
     rows_out = []
-    for sku in sorted(groups.keys()):
-        entry = {PXM_ID_COL: sku}
+    for mpn in sorted(groups.keys()):
+        entry = {PXM_MPN_COL: mpn, PXM_MASTER_ID_COL: master_ids.get(mpn, "")}
         for i, col_name in enumerate(image_cols):
-            entry[col_name] = groups[sku][i]["url"] if i < len(groups[sku]) else ""
+            entry[col_name] = groups[mpn][i]["url"] if i < len(groups[mpn]) else ""
         rows_out.append(entry)
 
-    pivot_df = pd.DataFrame(rows_out, columns=[PXM_ID_COL] + image_cols)
+    pivot_df = pd.DataFrame(rows_out, columns=[PXM_MPN_COL, PXM_MASTER_ID_COL] + image_cols)
     return pivot_df, image_cols
 
 
-def build_pivot_table_html(df, image_cols, thumb_size):
-    header_cells = f"<th>{PXM_ID_COL}</th>" + "".join(f"<th>{col}</th>" for col in image_cols)
+def build_pivot_table_html(df, id_cols, image_cols, thumb_size):
+    header_cells = "".join(f"<th>{c}</th>" for c in id_cols) + "".join(f"<th>{col}</th>" for col in image_cols)
     body_rows = []
     for _, row in df.iterrows():
-        cells = [f"<td>{row[PXM_ID_COL]}</td>"]
+        cells = [f"<td>{row[c]}</td>" for c in id_cols]
         for col in image_cols:
             val = str(row[col]) if pd.notna(row[col]) else ""
             if is_url(val):
@@ -670,7 +705,8 @@ def render_pxm_url_tab():
             row = pivot_df.iloc[row_idx]
             row_cols = st.columns([2] + [1] * len(image_cols))
             with row_cols[0]:
-                st.write(f"**{row[PXM_ID_COL]}**")
+                st.write(f"**{row[PXM_MPN_COL]}**")
+                st.caption(f"Master ID: {row[PXM_MASTER_ID_COL]}")
             for i, col in enumerate(image_cols):
                 with row_cols[1 + i]:
                     val = str(row[col]) if pd.notna(row[col]) else ""
@@ -705,7 +741,7 @@ def render_pxm_url_tab():
             for i, s in enumerate(st.session_state.pxm_swaps):
                 lc1, lc2, lc3 = st.columns([3, 3, 1])
                 with lc1:
-                    st.write(f"Row {s['row'] + 1} — {pivot_df.iloc[s['row']][PXM_ID_COL]}")
+                    st.write(f"Row {s['row'] + 1} — {pivot_df.iloc[s['row']][PXM_MPN_COL]}")
                 with lc2:
                     st.write(f"{s['col_a']}  ⇄  {s['col_b']}")
                 with lc3:
@@ -713,12 +749,12 @@ def render_pxm_url_tab():
                         st.session_state.pxm_swaps.pop(i)
                         st.rerun()
     else:
-        table_html = build_pivot_table_html(pivot_df, image_cols, thumb_size)
+        table_html = build_pivot_table_html(pivot_df, [PXM_MPN_COL, PXM_MASTER_ID_COL], image_cols, thumb_size)
         st.markdown(get_table_css(get_theme_mode()) + table_html, unsafe_allow_html=True)
 
     st.subheader("Download")
-    table_html = build_pivot_table_html(pivot_df, image_cols, thumb_size)
-    d1, d2 = st.columns(2)
+    table_html = build_pivot_table_html(pivot_df, [PXM_MPN_COL, PXM_MASTER_ID_COL], image_cols, thumb_size)
+    d1, d2, d3 = st.columns(3)
     with d1:
         report_html = build_full_report(table_html, get_theme_mode())
         st.download_button(
@@ -731,10 +767,22 @@ def render_pxm_url_tab():
         buf = io.BytesIO()
         pivot_df.to_excel(buf, index=False, engine="openpyxl")
         st.download_button(
-            label="Download as Excel (SKU + Images)",
+            label="Download as Excel (MPN + Master ID + Images)",
             data=buf.getvalue(),
             file_name="pxm_images_report.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    with d3:
+        pxm_swapped_rows = {s["row"] for s in st.session_state.pxm_swaps}
+        two_tab_bytes = build_two_tab_pivot_excel(
+            base_pivot_df, pivot_df, [PXM_MPN_COL, PXM_MASTER_ID_COL], image_cols, pxm_swapped_rows
+        )
+        st.download_button(
+            label="Download as Excel (Original + Reorder tabs)",
+            data=two_tab_bytes,
+            file_name="pxm_images_report_reorder.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            help="Tab 1 'Original': MPN, Master ID, Images exactly as uploaded. Tab 2 'Reorder': only the rows you swapped, with that swap applied.",
         )
 
 
@@ -745,9 +793,9 @@ def render_media_stack_tab():
     if uploaded is None:
         st.info(
             "Upload the PXM Media Stack export. Pick which column holds the Stack Group name "
-            "(e.g. Amazon US / Target US / Walmart US / Default), the SKU, the image position, "
-            "and the image link, then pick ONE stack group to view, and that group's SKUs and "
-            "images are laid out as SKU + Image 1..N."
+            "(e.g. Amazon US / Target US / Walmart US / Default), the Filename, the image position, "
+            "and the image link, then pick ONE stack group to view. The MPN and Master ID are parsed "
+            "from the Filename column, and that group's products are laid out as MPN + Master ID + Image 1..N."
         )
         return
 
@@ -777,9 +825,10 @@ def render_media_stack_tab():
             index=cols.index(default_or_first("Media Stack Group")), key="media_stack_group_col",
         )
     with c2:
-        id_col = st.selectbox(
-            "SKU / Identifier column", cols,
-            index=cols.index(default_or_first("Collection Folder")), key="media_stack_id_col",
+        filename_col = st.selectbox(
+            "Filename column", cols,
+            index=cols.index(default_or_first("Filename")), key="media_stack_filename_col",
+            help='Anything before the first "_" is read as the MPN, and the segment right after it as the Master ID.',
         )
     c3, c4 = st.columns(2)
     with c3:
@@ -800,10 +849,10 @@ def render_media_stack_tab():
     selected_group = st.selectbox("Which Stack Group?", group_values, key="media_stack_group_value")
 
     filtered = raw[raw[group_col] == selected_group]
-    base_pivot_df, image_cols = build_media_stack_pivot(filtered, id_col, position_col, link_col)
+    base_pivot_df, image_cols = build_media_stack_pivot(filtered, filename_col, position_col, link_col)
 
     if base_pivot_df.empty:
-        st.warning("Couldn't find any rows with a parseable SKU + position + link for this group.")
+        st.warning("Couldn't find any rows with a parseable filename + position + link for this group.")
         return
 
     st.success(f"Found {len(base_pivot_df)} SKU(s) in '{selected_group}' across {len(filtered)} image row(s).")
@@ -842,7 +891,8 @@ def render_media_stack_tab():
             row = pivot_df.iloc[row_idx]
             row_cols = st.columns([2] + [1] * len(image_cols))
             with row_cols[0]:
-                st.write(f"**{row[PXM_ID_COL]}**")
+                st.write(f"**{row[PXM_MPN_COL]}**")
+                st.caption(f"Master ID: {row[PXM_MASTER_ID_COL]}")
             for i, col in enumerate(image_cols):
                 with row_cols[1 + i]:
                     val = str(row[col]) if pd.notna(row[col]) else ""
@@ -877,7 +927,7 @@ def render_media_stack_tab():
             for i, s in enumerate(st.session_state.media_swaps):
                 lc1, lc2, lc3 = st.columns([3, 3, 1])
                 with lc1:
-                    st.write(f"Row {s['row'] + 1} — {pivot_df.iloc[s['row']][PXM_ID_COL]}")
+                    st.write(f"Row {s['row'] + 1} — {pivot_df.iloc[s['row']][PXM_MPN_COL]}")
                 with lc2:
                     st.write(f"{s['col_a']}  ⇄  {s['col_b']}")
                 with lc3:
@@ -885,12 +935,12 @@ def render_media_stack_tab():
                         st.session_state.media_swaps.pop(i)
                         st.rerun()
     else:
-        table_html = build_pivot_table_html(pivot_df, image_cols, thumb_size)
+        table_html = build_pivot_table_html(pivot_df, [PXM_MPN_COL, PXM_MASTER_ID_COL], image_cols, thumb_size)
         st.markdown(get_table_css(get_theme_mode()) + table_html, unsafe_allow_html=True)
 
     st.subheader("Download")
-    table_html = build_pivot_table_html(pivot_df, image_cols, thumb_size)
-    d1, d2 = st.columns(2)
+    table_html = build_pivot_table_html(pivot_df, [PXM_MPN_COL, PXM_MASTER_ID_COL], image_cols, thumb_size)
+    d1, d2, d3 = st.columns(3)
     with d1:
         report_html = build_full_report(table_html, get_theme_mode())
         st.download_button(
@@ -903,10 +953,22 @@ def render_media_stack_tab():
         buf = io.BytesIO()
         pivot_df.to_excel(buf, index=False, engine="openpyxl")
         st.download_button(
-            label="Download as Excel (SKU + Images)",
+            label="Download as Excel (MPN + Master ID + Images)",
             data=buf.getvalue(),
             file_name=f"media_stack_{selected_group.replace(' ', '_')}_report.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    with d3:
+        media_swapped_rows = {s["row"] for s in st.session_state.media_swaps}
+        two_tab_bytes = build_two_tab_pivot_excel(
+            base_pivot_df, pivot_df, [PXM_MPN_COL, PXM_MASTER_ID_COL], image_cols, media_swapped_rows
+        )
+        st.download_button(
+            label="Download as Excel (Original + Reorder tabs)",
+            data=two_tab_bytes,
+            file_name=f"media_stack_{selected_group.replace(' ', '_')}_reorder.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            help="Tab 1 'Original': SKU/Identifier + Images exactly as uploaded. Tab 2 'Reorder': only the rows you swapped, with that swap applied.",
         )
 
 
