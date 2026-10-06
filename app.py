@@ -3,15 +3,24 @@ Images Viewer
 --------------
 Upload an Excel file, pick which sheet/tab to use, map which columns hold
 the SKU, Title, and Image URL(s), and preview the image URLs as inline
-thumbnails. Export the result as a standalone HTML report.
+thumbnails. Export the result as a standalone HTML report, or attach
+per-row comments (e.g. "title is not matching with main image") and
+download the SAME Excel file back with those comments written onto the
+SKU cells, just like adding a comment manually in the masterfile.
 
 Run with:
     pip install -r requirements.txt
     streamlit run app.py
 """
 
+import io
+import os
+
 import pandas as pd
 import streamlit as st
+from openpyxl import load_workbook
+from openpyxl.comments import Comment
+from openpyxl.utils import get_column_letter
 
 st.set_page_config(page_title="Images Viewer", page_icon=":frame_with_picture:", layout="wide")
 
@@ -23,6 +32,8 @@ table.iv-table th { background: #e0e7ff; color: #1e40af; }
 table.iv-table img { display: block; margin: auto; border-radius: 5px; }
 </style>
 """
+
+COMMENT_AUTHOR = "Images Viewer"
 
 
 def is_url(value) -> bool:
@@ -61,6 +72,21 @@ def build_full_report(table_html: str) -> str:
 </html>"""
 
 
+def build_commented_workbook(file_bytes, sheet_name, sku_col_pos, header_row_idx, comments_by_row):
+    """Reopen the ORIGINAL uploaded file and write each comment onto the
+    SKU cell of its row, preserving everything else in the workbook."""
+    wb = load_workbook(io.BytesIO(file_bytes))
+    ws = wb[sheet_name]
+    col_letter = get_column_letter(sku_col_pos + 1)
+    for row_index, note in comments_by_row.items():
+        excel_row = header_row_idx + row_index + 2  # +1 for header row, +1 for 1-indexing
+        cell = ws[f"{col_letter}{excel_row}"]
+        cell.comment = Comment(note, COMMENT_AUTHOR)
+    out = io.BytesIO()
+    wb.save(out)
+    return out.getvalue()
+
+
 st.title(":frame_with_picture: Images Viewer")
 st.caption("Upload an Excel file, map your columns, and preview image URLs as thumbnails.")
 
@@ -70,8 +96,18 @@ if uploaded is None:
     st.info("Once you upload a file, you'll pick the sheet, header row, and which columns are SKU / Title / Images.")
     st.stop()
 
+# Read the raw bytes once so we can both parse it with pandas AND, later,
+# reopen the exact same original file with openpyxl to write comments back.
+file_bytes = uploaded.getvalue()
+
+if "sku_comments" not in st.session_state:
+    st.session_state.sku_comments = {}
+if "last_uploaded_name" not in st.session_state or st.session_state.last_uploaded_name != uploaded.name:
+    st.session_state.sku_comments = {}
+    st.session_state.last_uploaded_name = uploaded.name
+
 try:
-    xls = pd.ExcelFile(uploaded, engine="openpyxl")
+    xls = pd.ExcelFile(io.BytesIO(file_bytes), engine="openpyxl")
 except Exception as exc:
     st.error(f"Could not read this file: {exc}")
     st.stop()
@@ -126,11 +162,63 @@ st.subheader("Preview")
 table_html = build_table_html(data, sku_col, title_col, image_cols, thumb_size)
 st.markdown(TABLE_CSS + table_html, unsafe_allow_html=True)
 
-st.subheader("5. Download")
-report_html = build_full_report(table_html)
-st.download_button(
-    label="Download as HTML report",
-    data=report_html.encode("utf-8"),
-    file_name="images_viewer_report.html",
-    mime="text/html",
+st.subheader("5. Add a comment for a specific SKU (optional)")
+st.caption(
+    "E.g. \"title is not matching with main image\" — this gets written as a real Excel "
+    "comment on that SKU's cell, same as adding one by hand in the masterfile."
 )
+
+row_options = list(range(len(data)))
+row_labels = {i: f"Row {i + 1} — SKU: {data.iloc[i][sku_col]}" for i in row_options}
+
+c1, c2 = st.columns([1, 2])
+with c1:
+    selected_row = st.selectbox(
+        "Row", row_options, format_func=lambda i: row_labels[i], key="comment_row_select"
+    )
+with c2:
+    note_text = st.text_input("Comment", key="comment_text_input")
+
+if st.button("Add comment", disabled=not note_text.strip()):
+    st.session_state.sku_comments[selected_row] = note_text.strip()
+    st.rerun()
+
+if st.session_state.sku_comments:
+    st.write("Comments added so far:")
+    for row_index, note in list(st.session_state.sku_comments.items()):
+        cc1, cc2, cc3 = st.columns([2, 4, 1])
+        with cc1:
+            st.write(row_labels.get(row_index, f"Row {row_index + 1}"))
+        with cc2:
+            st.write(note)
+        with cc3:
+            if st.button("Remove", key=f"remove_comment_{row_index}"):
+                del st.session_state.sku_comments[row_index]
+                st.rerun()
+
+st.subheader("6. Download")
+
+dl1, dl2 = st.columns(2)
+with dl1:
+    report_html = build_full_report(table_html)
+    st.download_button(
+        label="Download as HTML report",
+        data=report_html.encode("utf-8"),
+        file_name="images_viewer_report.html",
+        mime="text/html",
+    )
+with dl2:
+    sku_col_pos = headers.index(sku_col)
+    commented_bytes = build_commented_workbook(
+        file_bytes, sheet_name, sku_col_pos, header_row_idx, st.session_state.sku_comments
+    )
+    base, ext = os.path.splitext(uploaded.name)
+    out_name = f"{base}_with_comments{ext or '.xlsx'}"
+    st.download_button(
+        label="Download same Excel file (with comments)",
+        data=commented_bytes,
+        file_name=out_name,
+        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        disabled=not st.session_state.sku_comments,
+        help="Add at least one comment above to enable this.",
+    )
