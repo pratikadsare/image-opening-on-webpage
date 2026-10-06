@@ -83,16 +83,17 @@ def build_full_report(table_html: str) -> str:
 </html>"""
 
 
-def build_two_tab_excel(base_data, data, sku_col, title_col, image_cols):
+def build_two_tab_excel(base_data, data, sku_col, title_col, image_cols, swapped_rows):
     """A plain .xlsx with two tabs:
     - "Original": SKU, Title, Image URLs exactly as uploaded, no swaps.
-    - "Reorder": just the SKU (Master ID) and Image URL columns, with any
-      queued swaps applied.
+    - "Reorder": just the SKU (Master ID) and Image URL columns, ONLY for
+      the rows that actually had a swap queued, with that swap applied.
     """
     original_df = base_data[[sku_col, title_col] + image_cols].copy()
     original_df.columns = ["SKU", "Title"] + image_cols
 
-    reorder_df = data[[sku_col] + image_cols].copy()
+    reorder_rows = sorted(swapped_rows)
+    reorder_df = data.loc[reorder_rows, [sku_col] + image_cols].copy()
     reorder_df.columns = ["SKU"] + image_cols
 
     buf = io.BytesIO()
@@ -269,13 +270,14 @@ with dl1:
         mime="text/html",
     )
 with dl2:
-    two_tab_bytes = build_two_tab_excel(base_data, data, sku_col, title_col, image_cols)
+    swapped_rows = {s["row"] for s in st.session_state.swaps}
+    two_tab_bytes = build_two_tab_excel(base_data, data, sku_col, title_col, image_cols, swapped_rows)
     st.download_button(
         label="Download as Excel (Original + Reorder tabs)",
         data=two_tab_bytes,
         file_name="images_viewer_report.xlsx",
         mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        help="Tab 1 'Original': SKU, Title, Images exactly as uploaded. Tab 2 'Reorder': SKU + Image links only, with swaps applied.",
+        help="Tab 1 'Original': SKU, Title, Images exactly as uploaded. Tab 2 'Reorder': only the SKUs you swapped, SKU + Image links, with the swap applied.",
     )
 with dl3:
     swapped_bytes = build_swapped_workbook(file_bytes, sheet_name, headers, header_row_idx, st.session_state.swaps)
