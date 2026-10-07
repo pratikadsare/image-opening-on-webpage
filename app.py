@@ -200,19 +200,27 @@ hr {{
 
 
 def render_theme_toggle() -> None:
-    """A Day/Night button pinned at the top of the app."""
+    """Title plus the Rocket mode and Day/Night buttons at the top."""
     st.session_state.setdefault("theme_mode", "light")
+    st.session_state.setdefault("rocket_mode", True)
     inject_app_theme_css(st.session_state["theme_mode"])
 
-    left, right = st.columns([5, 1])
+    left, mid, right = st.columns([4, 1, 1])
     with left:
         st.title("\U0001F5BC\ufe0f Images Viewer")
+    with mid:
+        rocket_on = st.session_state["rocket_mode"]
+        rocket_label = "\U0001F680 Rocket: On" if rocket_on else "\U0001F680 Rocket: Off"
+        if st.button(rocket_label, use_container_width=True, key="rocket_toggle_btn"):
+            st.session_state["rocket_mode"] = not rocket_on
+            st.rerun()
     with right:
         is_dark = st.session_state["theme_mode"] == "dark"
         label = "☀️ Day Mode" if is_dark else "🌙 Night Mode"
         if st.button(label, use_container_width=True, key="theme_toggle_btn"):
             st.session_state["theme_mode"] = "light" if is_dark else "dark"
             st.rerun()
+    render_rocket(st.session_state["rocket_mode"])
 
 
 def is_url(value) -> bool:
@@ -355,6 +363,251 @@ LIGHTBOX_JS = r"""
 """
 
 
+
+# ---------------------------------------------------------------------------
+# Rocket mode: the mouse pointer becomes a rocket whose flame grows with the
+# speed of the mouse. A browser cannot animate the real cursor, so the normal
+# cursor is hidden and a rocket + flame is drawn on a canvas that follows it.
+# The canvas lives in the main page; the preview-table iframes relay their
+# mouse positions to it.
+# ---------------------------------------------------------------------------
+
+ROCKET_JS = r"""
+<script>
+(function () {
+  var V = 3;
+  var ENABLED = __ENABLED__;
+  var host;
+  try { host = (window.parent && window.parent !== window && window.parent.document) ? window.parent : window; } catch (e) { host = window; }
+  if (host.__rocket && host.__rocket.v !== V) { host.__rocket.destroy(); host.__rocket = null; }
+  if (host.__rocket) { host.__rocket.setEnabled(ENABLED); return; }
+
+  var doc = host.document;
+  var cv = doc.createElement("canvas");
+  cv.id = "iv-rocket-canvas";
+  cv.style.cssText = "position:fixed;left:0;top:0;width:100vw;height:100vh;pointer-events:none;z-index:2147483600;";
+  doc.body.appendChild(cv);
+  var ctx = cv.getContext("2d");
+  var st = doc.createElement("style");
+  st.id = "iv-rocket-style";
+  st.textContent = "html.iv-rocket-on, html.iv-rocket-on * { cursor: none !important; }";
+  doc.head.appendChild(st);
+
+  function resize() {
+    var d = host.devicePixelRatio || 1;
+    cv.width = Math.floor(host.innerWidth * d);
+    cv.height = Math.floor(host.innerHeight * d);
+    ctx.setTransform(d, 0, 0, d, 0, 0);
+  }
+  resize();
+  host.addEventListener("resize", resize);
+
+  var R = {v: V, enabled: false};
+  var px = -200, py = -200, lastX = null, lastY = null, lastT = 0;
+  var speed = 0, ang = -2.356, visible = false, parts = [], raf = 0, lastFrame = 0;
+  var LEN = 34;
+
+  function lerpAngle(a, b, t) {
+    var d = Math.atan2(Math.sin(b - a), Math.cos(b - a));
+    return a + d * t;
+  }
+
+  R.move = function (x, y) {
+    var now = performance.now();
+    if (lastX !== null) {
+      var dx = x - lastX, dy = y - lastY, dist = Math.sqrt(dx * dx + dy * dy);
+      var dt = Math.max(1, now - lastT);
+      speed = speed * 0.6 + (dist / dt) * 0.4;
+      if (dist > 2) { ang = lerpAngle(ang, Math.atan2(dy, dx), 0.35); }
+    }
+    lastX = x; lastY = y; lastT = now; px = x; py = y; visible = true;
+  };
+
+  R.burst = function (x, y) {
+    for (var i = 0; i < 22; i++) {
+      var a = Math.random() * Math.PI * 2, v = 0.1 + Math.random() * 0.35;
+      parts.push({x: x, y: y, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: 350 + Math.random() * 350, age: 0, size: 2 + Math.random() * 4, spark: false});
+    }
+  };
+
+  function emit(s) {
+    var tx = px - Math.cos(ang) * LEN, ty = py - Math.sin(ang) * LEN;
+    var back = ang + Math.PI;
+    var n = Math.round(1 + s * 5);
+    for (var i = 0; i < n; i++) {
+      var a = back + (Math.random() - 0.5) * (0.35 + s * 0.08);
+      var v = 0.03 + Math.random() * 0.08 + s * 0.12;
+      parts.push({x: tx, y: ty, vx: Math.cos(a) * v, vy: Math.sin(a) * v, life: 220 + Math.random() * 260 + s * 170, age: 0, size: 3 + Math.random() * 4 + s * 1.6, spark: false});
+    }
+    if (s > 1.6) {
+      var k = Math.round(s * 1.5);
+      for (var j = 0; j < k; j++) {
+        var b = back + (Math.random() - 0.5) * 1.4;
+        var w = 0.15 + Math.random() * 0.35;
+        parts.push({x: tx, y: ty, vx: Math.cos(b) * w, vy: Math.sin(b) * w, life: 300 + Math.random() * 500, age: 0, size: 1.2 + Math.random() * 1.6, spark: true});
+      }
+    }
+    if (parts.length > 700) { parts.splice(0, parts.length - 700); }
+  }
+
+  function drawFlame(s) {
+    var len = 8 + Math.min(s, 5) * 32;
+    len *= 0.88 + Math.random() * 0.24;
+    var back = ang + Math.PI;
+    var tx = px - Math.cos(ang) * LEN, ty = py - Math.sin(ang) * LEN;
+    ctx.save();
+    ctx.translate(tx, ty);
+    ctx.rotate(back);
+    var g = ctx.createLinearGradient(0, 0, len, 0);
+    g.addColorStop(0, "rgba(255,255,230,0.95)");
+    g.addColorStop(0.3, "rgba(255,200,60,0.85)");
+    g.addColorStop(0.7, "rgba(255,90,20,0.5)");
+    g.addColorStop(1, "rgba(255,40,0,0)");
+    ctx.fillStyle = g;
+    ctx.beginPath();
+    ctx.moveTo(0, -5.5);
+    ctx.quadraticCurveTo(len * 0.5, -7, len, 0);
+    ctx.quadraticCurveTo(len * 0.5, 7, 0, 5.5);
+    ctx.closePath();
+    ctx.fill();
+    ctx.restore();
+  }
+
+  function drawParts(dt) {
+    for (var i = parts.length - 1; i >= 0; i--) {
+      var p = parts[i];
+      p.age += dt;
+      if (p.age >= p.life) { parts.splice(i, 1); continue; }
+      p.x += p.vx * dt; p.y += p.vy * dt - 0.012 * dt * (p.spark ? 0 : 1);
+      p.vx *= 0.985; p.vy *= 0.985;
+      var k = p.age / p.life, r, g, b;
+      if (p.spark) { r = 255; g = 235; b = 160; }
+      else if (k < 0.25) { r = 255; g = 245; b = 190; }
+      else if (k < 0.5) { r = 255; g = 175; b = 50; }
+      else if (k < 0.8) { r = 255; g = 85; b = 20; }
+      else { r = 150; g = 70; b = 60; }
+      ctx.fillStyle = "rgba(" + r + "," + g + "," + b + "," + (1 - k) * 0.9 + ")";
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, Math.max(0.4, p.size * (1 - k * 0.6)), 0, 6.2832);
+      ctx.fill();
+    }
+  }
+
+  function drawRocket() {
+    ctx.save();
+    ctx.translate(px, py);
+    ctx.rotate(ang);
+    ctx.fillStyle = "#ef4444";
+    ctx.beginPath(); ctx.moveTo(-22, -7); ctx.lineTo(-35, -16); ctx.lineTo(-31, -5); ctx.closePath(); ctx.fill();
+    ctx.beginPath(); ctx.moveTo(-22, 7); ctx.lineTo(-35, 16); ctx.lineTo(-31, 5); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = "#475569";
+    ctx.fillRect(-36, -3.5, 4, 7);
+    var bg = ctx.createLinearGradient(0, -9, 0, 9);
+    bg.addColorStop(0, "#ffffff"); bg.addColorStop(1, "#cbd5e1");
+    ctx.fillStyle = bg; ctx.strokeStyle = "#64748b"; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(0, 0);
+    ctx.bezierCurveTo(-8, -9, -20, -9, -33, -7); ctx.lineTo(-33, 7);
+    ctx.bezierCurveTo(-20, 9, -8, 9, 0, 0); ctx.closePath(); ctx.fill(); ctx.stroke();
+    ctx.fillStyle = "#ef4444";
+    ctx.beginPath(); ctx.moveTo(0, 0);
+    ctx.bezierCurveTo(-4, -4, -9, -6, -13, -6.3); ctx.lineTo(-13, 6.3);
+    ctx.bezierCurveTo(-9, 6, -4, 4, 0, 0); ctx.closePath(); ctx.fill();
+    ctx.fillStyle = "#38bdf8"; ctx.strokeStyle = "#1e3a8a"; ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.arc(-22, 0, 3.6, 0, 6.2832); ctx.fill(); ctx.stroke();
+    ctx.restore();
+  }
+
+  function frame(t) {
+    raf = host.requestAnimationFrame(frame);
+    var dt = Math.min(40, t - lastFrame) || 16;
+    lastFrame = t;
+    ctx.clearRect(0, 0, host.innerWidth, host.innerHeight);
+    speed *= Math.pow(0.93, dt / 16);
+    if (speed < 0.01) { speed = 0; }
+    if (visible) { emit(Math.min(speed, 5)); }
+    drawParts(dt);
+    if (visible) { drawFlame(Math.min(speed, 5)); drawRocket(); }
+  }
+
+  R.setEnabled = function (on) {
+    R.enabled = !!on;
+    doc.documentElement.classList.toggle("iv-rocket-on", R.enabled);
+    if (R.enabled && !raf) { lastFrame = performance.now(); raf = host.requestAnimationFrame(frame); }
+    if (!R.enabled) {
+      if (raf) { host.cancelAnimationFrame(raf); raf = 0; }
+      parts = []; visible = false; lastX = null;
+      ctx.clearRect(0, 0, host.innerWidth, host.innerHeight);
+    }
+  };
+
+  function onMove(e) { if (R.enabled) { R.move(e.clientX, e.clientY); } }
+  function onDown(e) { if (R.enabled) { R.burst(e.clientX, e.clientY); } }
+  function onOut(e) { if (!e.relatedTarget) { visible = false; lastX = null; } }
+  doc.addEventListener("mousemove", onMove, true);
+  doc.addEventListener("mousedown", onDown, true);
+  doc.addEventListener("mouseout", onOut, true);
+
+  R.destroy = function () {
+    R.setEnabled(false);
+    doc.removeEventListener("mousemove", onMove, true);
+    doc.removeEventListener("mousedown", onDown, true);
+    doc.removeEventListener("mouseout", onOut, true);
+    host.removeEventListener("resize", resize);
+    cv.remove(); st.remove();
+  };
+
+  host.__rocket = R;
+  R.setEnabled(ENABLED);
+})();
+</script>
+"""
+
+# Runs inside each preview-table iframe: hides the real cursor there and
+# forwards mouse positions (converted to page coordinates) to the rocket.
+ROCKET_RELAY_JS = r"""
+<script>
+(function () {
+  var host;
+  try { host = (window.parent && window.parent !== window && window.parent.document) ? window.parent : null; } catch (e) { host = null; }
+  if (!host) return;
+  var st = document.createElement("style");
+  st.textContent = "html.iv-rocket, html.iv-rocket * { cursor: none !important; }";
+  document.head.appendChild(st);
+  function sync() {
+    var r = host.__rocket;
+    document.documentElement.classList.toggle("iv-rocket", !!(r && r.enabled));
+    return r && r.enabled ? r : null;
+  }
+  function offset() {
+    var fe = window.frameElement;
+    return fe ? fe.getBoundingClientRect() : null;
+  }
+  sync();
+  document.addEventListener("mousemove", function (e) {
+    var r = sync(), b = offset();
+    if (r && b) { r.move(b.left + e.clientX, b.top + e.clientY); }
+  }, true);
+  document.addEventListener("mousedown", function (e) {
+    var r = sync(), b = offset();
+    if (r && b) { r.burst(b.left + e.clientX, b.top + e.clientY); }
+  }, true);
+})();
+</script>
+"""
+
+
+def embed_html(page: str, height: int) -> None:
+    """Show an HTML page (with scripts) in an iframe."""
+    if hasattr(st, "iframe"):
+        st.iframe(page, height=height)
+    else:  # older Streamlit versions
+        components.html(page, height=height, scrolling=True)
+
+
+def render_rocket(enabled: bool) -> None:
+    embed_html(ROCKET_JS.replace("__ENABLED__", "true" if enabled else "false"), 1)
+
+
 def url_basename(url: str) -> str:
     try:
         return os.path.basename(urlparse(str(url)).path) or ""
@@ -395,13 +648,11 @@ def show_table(table_html, n_rows, thumb_size):
         + f'<body style="margin:0;font-family:Arial,sans-serif;color:{p["text"]};background:transparent;">'
         + table_html
         + LIGHTBOX_JS
+        + ROCKET_RELAY_JS
         + "</body>"
     )
     height = int(min(780, max(180, 70 + n_rows * (thumb_size + 30))))
-    if hasattr(st, "iframe"):
-        st.iframe(page, height=height)
-    else:  # older Streamlit versions
-        components.html(page, height=height, scrolling=True)
+    embed_html(page, height)
 
 
 def build_table_html(df, mpn_col, master_col, title_col, image_cols, thumb_size):
