@@ -34,7 +34,7 @@ import streamlit as st
 import streamlit.components.v1 as components
 from openpyxl import load_workbook
 
-st.set_page_config(page_title="Images Viewer", page_icon=":frame_with_picture:", layout="wide")
+st.set_page_config(page_title="Images Viewer", page_icon="\U0001F5BC\ufe0f", layout="wide")
 
 # ---------------------------------------------------------------------------
 # Theme: light-blue by default, with a Day/Night toggle at the top.
@@ -206,7 +206,7 @@ def render_theme_toggle() -> None:
 
     left, right = st.columns([5, 1])
     with left:
-        st.title(":frame_with_picture: Images Viewer")
+        st.title("\U0001F5BC\ufe0f Images Viewer")
     with right:
         is_dark = st.session_state["theme_mode"] == "dark"
         label = "☀️ Day Mode" if is_dark else "🌙 Night Mode"
@@ -674,9 +674,6 @@ def render_simple_tab():
     ]
     base_data = raw.iloc[header_row_idx + 1 :].reset_index(drop=True)
     base_data.columns = headers
-
-    with st.expander("Preview raw data (first 5 rows after the header)"):
-        st.dataframe(base_data.head(5), width="stretch")
 
     st.subheader("3. Map your columns")
     def guess(names, fallback):
